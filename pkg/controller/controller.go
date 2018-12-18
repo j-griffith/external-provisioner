@@ -110,6 +110,7 @@ const (
 	defaultFSType = "ext4"
 
 	snapshotKind     = "VolumeSnapshot"
+	pvcKind          = "PVC"
 	snapshotAPIGroup = snapapi.GroupName // "snapshot.storage.k8s.io"
 )
 
@@ -171,6 +172,7 @@ const (
 	PluginCapability_ACCESSIBILITY_CONSTRAINTS
 	ControllerCapability_CREATE_DELETE_VOLUME
 	ControllerCapability_CREATE_DELETE_SNAPSHOT
+	ControllerCapability_CLONE_VOLUME
 )
 
 var _ controller.Provisioner = &csiProvisioner{}
@@ -284,6 +286,8 @@ func getDriverCapabilities(conn *grpc.ClientConn, timeout time.Duration) (sets.I
 			capabilities.Insert(ControllerCapability_CREATE_DELETE_VOLUME)
 		case csi.ControllerServiceCapability_RPC_CREATE_DELETE_SNAPSHOT:
 			capabilities.Insert(ControllerCapability_CREATE_DELETE_SNAPSHOT)
+		case csi.ControllerServiceCapability_RPC_CLONE_VOLUME:
+			capabilities.Insert(ControllerCapability_CLONE_VOLUME)
 		}
 	}
 	return capabilities, nil
@@ -346,7 +350,7 @@ func NewCSIProvisioner(client kubernetes.Interface,
 // This function get called before any attempt to communicate with the driver.
 // Before initiating Create/Delete API calls provisioner checks if Capabilities:
 // PluginControllerService,  ControllerCreateVolume sre supported and gets the  driver name.
-func checkDriverState(grpcClient *grpc.ClientConn, timeout time.Duration, needSnapshotSupport bool) (*driverState, error) {
+func checkDriverState(grpcClient *grpc.ClientConn, timeout time.Duration, needSnapshotSupport, needCloneSupport bool) (*driverState, error) {
 	capabilities, err := getDriverCapabilities(grpcClient, timeout)
 	if err != nil {
 		return nil, fmt.Errorf("failed to get capabilities: %v", err)
@@ -361,13 +365,18 @@ func checkDriverState(grpcClient *grpc.ClientConn, timeout time.Duration, needSn
 	}
 
 	// If PVC.Spec.DataSource is not nil, it indicates the request is to create volume
-	// from snapshot and therefore we should check for snapshot support;
-	// otherwise we don't need to check for snapshot support.
+	// we parse out the DataSource type and request verification using the needXXXXSupport parameters
+	// If the caller isn't attempting a create from DataSource we skip checking
 	if needSnapshotSupport {
 		// Check whether plugin supports create snapshot
 		// If not, create volume from snapshot cannot proceed
 		if !capabilities.Has(ControllerCapability_CREATE_DELETE_SNAPSHOT) {
 			return nil, fmt.Errorf("no create/delete snapshot support detected. Cannot create volume from snapshot")
+		}
+	}
+	if needCloneSupport {
+		if !capabilities.Has(ControllerCapability_CLONE_VOLUME) {
+			return nil, fmt.Errorf("no clone volume support detected. Cannot create volume from volume")
 		}
 	}
 
@@ -451,26 +460,46 @@ func getVolumeCapability(
 	}
 }
 
+func verifySnapshotDataSource(options controller.VolumeOptions) (bool, error) {
+	if *(options.PVC.Spec.DataSource.APIGroup) != snapshotAPIGroup {
+		return false, fmt.Errorf("the PVC source does not belong to the right APIGroup. Expected %s, Got %s", snapshotAPIGroup, *(options.PVC.Spec.DataSource.APIGroup))
+	}
+	return true, nil
+}
+
+func verifyCloneDataSource(options controller.VolumeOptions) (bool, error) {
+	return true, nil
+}
+
 func (p *csiProvisioner) Provision(options controller.VolumeOptions) (*v1.PersistentVolume, error) {
 	if options.PVC.Spec.Selector != nil {
 		return nil, fmt.Errorf("claim Selector is not supported")
 	}
-
-	var needSnapshotSupport bool
+	var needSnapshotSupport, needCloneSupport bool
+	var err error
 	if options.PVC.Spec.DataSource != nil {
-		// PVC.Spec.DataSource.Name is the name of the VolumeSnapshot API object
+		// DataSource ALWAYS needs a name, get that out of the way first
 		if options.PVC.Spec.DataSource.Name == "" {
-			return nil, fmt.Errorf("the PVC source not found for PVC %s", options.PVC.Name)
+			return nil, fmt.Errorf("the DataSource Name is required, expected a source object name, Got %s", options.PVC.Name)
 		}
-		if options.PVC.Spec.DataSource.Kind != snapshotKind {
-			return nil, fmt.Errorf("the PVC source is not the right type. Expected %s, Got %s", snapshotKind, options.PVC.Spec.DataSource.Kind)
+
+		// We have different types of data sources, let's do a switch on the Kind and handle appropriately
+		// This section just does basic checking to make sure the provided data source options are valid, we'll check things like readiness of the source later
+		switch options.PVC.Spec.DataSource.Kind {
+		case snapshotKind:
+			needSnapshotSupport, err = verifySnapshotDataSource(options)
+		case pvcKind:
+			needCloneSupport, err = verifyCloneDataSource(options)
+		default:
+			return nil, fmt.Errorf("the PVC source is not the right type. Expected %s or %s, Got %s", snapshotKind, pvcKind, options.PVC.Spec.DataSource.Kind)
 		}
-		if *(options.PVC.Spec.DataSource.APIGroup) != snapshotAPIGroup {
-			return nil, fmt.Errorf("the PVC source does not belong to the right APIGroup. Expected %s, Got %s", snapshotAPIGroup, *(options.PVC.Spec.DataSource.APIGroup))
+
+		if err != nil {
+			return nil, err
 		}
-		needSnapshotSupport = true
 	}
-	driverState, err := checkDriverState(p.grpcClient, p.timeout, needSnapshotSupport)
+
+	driverState, err := checkDriverState(p.grpcClient, p.timeout, needSnapshotSupport, needCloneSupport)
 	if err != nil {
 		return nil, err
 	}
@@ -518,10 +547,10 @@ func (p *csiProvisioner) Provision(options controller.VolumeOptions) (*v1.Persis
 		},
 	}
 
-	if needSnapshotSupport {
+	if needSnapshotSupport || needCloneSupport {
 		volumeContentSource, err := p.getVolumeContentSource(options)
 		if err != nil {
-			return nil, fmt.Errorf("error getting snapshot handle for snapshot %s: %v", options.PVC.Spec.DataSource.Name, err)
+			return nil, fmt.Errorf("error getting content source %s for new volume: %v", options.PVC.Spec.DataSource.Name, err)
 		}
 		req.VolumeContentSource = volumeContentSource
 	}
@@ -696,6 +725,58 @@ func removePrefixedParameters(param map[string]string) (map[string]string, error
 }
 
 func (p *csiProvisioner) getVolumeContentSource(options controller.VolumeOptions) (*csi.VolumeContentSource, error) {
+	if options.PVC.Spec.DataSource.Kind == snapshotKind {
+		return p.getVolumeContentSnapshotSource(options)
+
+	} else if options.PVC.Spec.DataSource.Kind == "PersistentVolumeclaim" {
+		return p.getVolumeContentCloneSource(options)
+	} else {
+		// We check valid Kind early on in the provision func, but add a second safety net here
+		return nil, fmt.Errorf("error, unsupported content source specified: %s", options.PVC.Spec.DataSource.Kind)
+	}
+}
+
+func (p *csiProvisioner) getVolumeContentCloneSource(options controller.VolumeOptions) (*csi.VolumeContentSource, error) {
+	sourcePVC, err := p.client.CoreV1().PersistentVolumeClaims(options.PVC.Namespace).Get(options.PVC.Spec.DataSource.Name, metav1.GetOptions{})
+	if err != nil {
+		return nil, fmt.Errorf("error getting PVC %s from api server: %v", options.PVC.Spec.DataSource.Name, err)
+	}
+	// TODO: const?
+	// We really only need the PVC Name which we already have, but we still go out and fetch it to verify:
+	// 1. It exists and is in a valid state (Bound)
+	// 2. It belongs to the correct storage class
+	// 3. It hasn't been scheduled for deletion
+	// 4. It is a valid size (>= source PVC)
+	if string(sourcePVC.Status.Phase) != "Bound" {
+		return nil, fmt.Errorf("the PVC DataSource %s must have a status of Bound.  Got %v", options.PVC.Spec.DataSource.Name, sourcePVC.Status)
+	}
+	if sourcePVC.ObjectMeta.DeletionTimestamp != nil {
+		return nil, fmt.Errorf("the PVC DataSource %s is currently being deleted", options.PVC.Spec.DataSource.Name)
+	}
+	if sourcePVC.Spec.StorageClassName != options.PVC.Spec.StorageClassName {
+		return nil, fmt.Errorf("the source PVC and destination PVCs must be in the same storage class for cloning.  Source is in %v, but new PVC is in %v",
+			sourcePVC.Spec.StorageClassName, options.PVC.Spec.StorageClassName)
+	}
+	capacity := options.PVC.Spec.Resources.Requests[v1.ResourceName(v1.ResourceStorage)]
+	requestedSize := capacity.Value()
+	if requestedSize < int64(sourcePVC.Spec.Size()) {
+		return nil, fmt.Errorf("error, new PVC request must be greater than or equal in size to the specified PVC data source, requested %v but source is %v", requestedSize, sourcePVC.Spec.Size())
+	}
+
+	volumeSource := csi.VolumeContentSource_Volume{
+		Volume: &csi.VolumeContentSource_VolumeSource{
+			VolumeId: sourcePVC.Spec.VolumeName,
+		},
+	}
+	glog.V(5).Infof("VolumeContentSource_Volume %+v", volumeSource)
+
+	volumeContentSource := &csi.VolumeContentSource{
+		Type: &volumeSource,
+	}
+	return volumeContentSource, nil
+}
+
+func (p *csiProvisioner) getVolumeContentSnapshotSource(options controller.VolumeOptions) (*csi.VolumeContentSource, error) {
 	snapshotObj, err := p.snapshotClient.VolumesnapshotV1alpha1().VolumeSnapshots(options.PVC.Namespace).Get(options.PVC.Spec.DataSource.Name, metav1.GetOptions{})
 	if err != nil {
 		return nil, fmt.Errorf("error getting snapshot %s from api server: %v", options.PVC.Spec.DataSource.Name, err)
@@ -756,7 +837,7 @@ func (p *csiProvisioner) Delete(volume *v1.PersistentVolume) error {
 	}
 	volumeId := p.volumeHandleToId(volume.Spec.CSI.VolumeHandle)
 
-	_, err := checkDriverState(p.grpcClient, p.timeout, false)
+	_, err := checkDriverState(p.grpcClient, p.timeout, false, false)
 	if err != nil {
 		return err
 	}

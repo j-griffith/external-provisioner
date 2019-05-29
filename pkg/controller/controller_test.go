@@ -455,6 +455,15 @@ func provisionWithTopologyCapabilities() (connection.PluginCapabilitySet, connec
 		}
 }
 
+func provisionFromPVCCapabilities() (connection.PluginCapabilitySet, connection.ControllerCapabilitySet) {
+	return connection.PluginCapabilitySet{
+			csi.PluginCapability_Service_CONTROLLER_SERVICE: true,
+		}, connection.ControllerCapabilitySet{
+			csi.ControllerServiceCapability_RPC_CREATE_DELETE_VOLUME: true,
+			csi.ControllerServiceCapability_RPC_CLONE_VOLUME:         true,
+		}
+}
+
 // Minimal PVC required for tests to function
 func createFakePVC(requestBytes int64) *v1.PersistentVolumeClaim {
 	return &v1.PersistentVolumeClaim{
@@ -2084,5 +2093,228 @@ func runDeleteTest(t *testing.T, k string, tc deleteTestcase) {
 	}
 	if !tc.expectErr && err != nil {
 		t.Errorf("test %q: got error: %v", k, err)
+	}
+}
+
+// TestProvisionFromPVC tests create volume clone
+func TestProvisionFromPVC(t *testing.T) {
+	var requestedBytes int64 = 1000
+	var srcName = "src-pvc"
+	//var timeNow = time.Now().UnixNano()
+	//var metaTimeNowUnix = &metav1.Time{
+	//	Time: time.Unix(0, timeNow),
+	//}
+	deletePolicy := v1.PersistentVolumeReclaimDelete
+
+	type pvSpec struct {
+		Name          string
+		ReclaimPolicy v1.PersistentVolumeReclaimPolicy
+		AccessModes   []v1.PersistentVolumeAccessMode
+		Capacity      v1.ResourceList
+		CSIPVS        *v1.CSIPersistentVolumeSource
+	}
+
+	testcases := map[string]struct {
+		volOpts              controller.ProvisionOptions
+		restoredVolSizeSmall bool
+		wrongDataSource      bool
+		pvcStatusReady       bool
+		expectedPVSpec       *pvSpec
+		expectErr            bool
+	}{
+		"provision with pvc data source": {
+			volOpts: controller.ProvisionOptions{
+				StorageClass: &storagev1.StorageClass{
+					ReclaimPolicy: &deletePolicy,
+					Parameters:    map[string]string{},
+				},
+				PVName: "test-name",
+				PVC: &v1.PersistentVolumeClaim{
+					ObjectMeta: metav1.ObjectMeta{
+						UID: "testid",
+					},
+					Spec: v1.PersistentVolumeClaimSpec{
+						Selector: nil,
+						Resources: v1.ResourceRequirements{
+							Requests: v1.ResourceList{
+								v1.ResourceName(v1.ResourceStorage): resource.MustParse(strconv.FormatInt(requestedBytes, 10)),
+							},
+						},
+						AccessModes: []v1.PersistentVolumeAccessMode{v1.ReadWriteOnce},
+						DataSource: &v1.TypedLocalObjectReference{
+							Name: srcName,
+							Kind: "PersistentVolumeClaim",
+						},
+					},
+				},
+			},
+			pvcStatusReady: true,
+			expectedPVSpec: &pvSpec{
+				Name:          "test-testi",
+				ReclaimPolicy: v1.PersistentVolumeReclaimDelete,
+				AccessModes:   []v1.PersistentVolumeAccessMode{v1.ReadWriteOnce},
+				Capacity: v1.ResourceList{
+					v1.ResourceName(v1.ResourceStorage): bytesToGiQuantity(requestedBytes),
+				},
+				CSIPVS: &v1.CSIPersistentVolumeSource{
+					Driver:       "test-driver",
+					VolumeHandle: "test-volume-id",
+					FSType:       "ext4",
+					VolumeAttributes: map[string]string{
+						"storage.kubernetes.io/csiProvisionerIdentity": "test-provisioner",
+					},
+				},
+			},
+		},
+		"fail vol size less than src pvc size": {
+			volOpts: controller.ProvisionOptions{
+				StorageClass: &storagev1.StorageClass{
+					Parameters: map[string]string{},
+				},
+				PVName: "test-name",
+				PVC: &v1.PersistentVolumeClaim{
+					ObjectMeta: metav1.ObjectMeta{
+						UID: "testid",
+					},
+					Spec: v1.PersistentVolumeClaimSpec{
+						Selector: nil,
+						Resources: v1.ResourceRequirements{
+							Requests: v1.ResourceList{
+								v1.ResourceName(v1.ResourceStorage): resource.MustParse(strconv.FormatInt(100, 10)),
+							},
+						},
+						AccessModes: []v1.PersistentVolumeAccessMode{v1.ReadWriteOnce},
+						DataSource: &v1.TypedLocalObjectReference{
+							Name: srcName,
+							Kind: "PersistentVolumeClaim",
+						},
+					},
+				},
+			},
+			restoredVolSizeSmall: true,
+			pvcStatusReady:       true,
+			expectErr:            true,
+		},
+		"fail empty src pvc name": {
+			volOpts: controller.ProvisionOptions{
+				StorageClass: &storagev1.StorageClass{
+					Parameters: map[string]string{},
+				},
+				PVName: "test-name",
+				PVC: &v1.PersistentVolumeClaim{
+					ObjectMeta: metav1.ObjectMeta{
+						UID: "testid",
+					},
+					Spec: v1.PersistentVolumeClaimSpec{
+						Selector: nil,
+						Resources: v1.ResourceRequirements{
+							Requests: v1.ResourceList{
+								v1.ResourceName(v1.ResourceStorage): resource.MustParse(strconv.FormatInt(requestedBytes, 10)),
+							},
+						},
+						AccessModes: []v1.PersistentVolumeAccessMode{v1.ReadWriteOnce},
+						DataSource: &v1.TypedLocalObjectReference{
+							Name: "",
+							Kind: "PersistentVolumeClaim",
+						},
+					},
+				},
+			},
+			wrongDataSource: true,
+			expectErr:       true,
+		},
+		"fail invalid src pvc status": {
+			volOpts: controller.ProvisionOptions{
+				StorageClass: &storagev1.StorageClass{
+					Parameters: map[string]string{},
+				},
+				PVName: "test-name",
+				PVC: &v1.PersistentVolumeClaim{
+					ObjectMeta: metav1.ObjectMeta{
+						UID: "testid",
+					},
+					Spec: v1.PersistentVolumeClaimSpec{
+						Selector: nil,
+						Resources: v1.ResourceRequirements{
+							Requests: v1.ResourceList{
+								v1.ResourceName(v1.ResourceStorage): resource.MustParse(strconv.FormatInt(100, 10)),
+							},
+						},
+						AccessModes: []v1.PersistentVolumeAccessMode{v1.ReadWriteOnce},
+						DataSource: &v1.TypedLocalObjectReference{
+							Name: srcName,
+							Kind: "PersistentVolumeClaim",
+						},
+					},
+				},
+			},
+			pvcStatusReady: false,
+			expectErr:      true,
+		},
+	}
+
+	tmpdir := tempDir(t)
+	defer os.RemoveAll(tmpdir)
+	mockController, driver, _, controllerServer, csiConn, err := createMockServer(t, tmpdir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer mockController.Finish()
+	defer driver.Stop()
+
+	for k, tc := range testcases {
+		var clientSet kubernetes.Interface
+		clientSet = fakeclientset.NewSimpleClientset()
+		client := &fake.Clientset{}
+
+		client.AddReactor("get", "persistentvolumeclaims", func(action k8stesting.Action) (handled bool, ret runtime.Object, err error) {
+			pvc := createFakePVC(requestedBytes)
+			return true, pvc, nil
+		})
+
+		pluginCaps, controllerCaps := provisionFromPVCCapabilities()
+		csiProvisioner := NewCSIProvisioner(clientSet, 5*time.Second, "test-provisioner", "test", 5, csiConn.conn, client, driverName, pluginCaps, controllerCaps, "")
+
+		out := &csi.CreateVolumeResponse{
+			Volume: &csi.Volume{
+				CapacityBytes: requestedBytes,
+				VolumeId:      "test-volume-id",
+			},
+		}
+
+		// Setup mock call expectations.
+		// If tc.restoredVolSizeSmall is true, or tc.wrongDataSource is true, or
+		// tc.snapshotStatusReady is false,  create volume from snapshot operation will fail
+		// early and therefore CreateVolume is not expected to be called.
+		// When the following if condition is met, it is a valid create volume from snapshot
+		// operation and CreateVolume is expected to be called.
+		if tc.restoredVolSizeSmall == false && tc.wrongDataSource == false && tc.pvcStatusReady {
+			controllerServer.EXPECT().CreateVolume(gomock.Any(), gomock.Any()).Return(out, nil).Times(1)
+		}
+
+		pv, err := csiProvisioner.Provision(tc.volOpts)
+		if tc.expectErr && err == nil {
+			t.Errorf("test %q: Expected error, got none", k)
+		}
+
+		if !tc.expectErr && err != nil {
+			t.Errorf("test %q: got error: %v", k, err)
+		}
+
+		if tc.expectedPVSpec != nil {
+			if pv.Name != tc.expectedPVSpec.Name {
+				t.Errorf("test %q: expected PV name: %q, got: %q", k, tc.expectedPVSpec.Name, pv.Name)
+			}
+
+			if !reflect.DeepEqual(pv.Spec.Capacity, tc.expectedPVSpec.Capacity) {
+				t.Errorf("test %q: expected capacity: %v, got: %v", k, tc.expectedPVSpec.Capacity, pv.Spec.Capacity)
+			}
+
+			if tc.expectedPVSpec.CSIPVS != nil {
+				if !reflect.DeepEqual(pv.Spec.PersistentVolumeSource.CSI, tc.expectedPVSpec.CSIPVS) {
+					t.Errorf("test %q: expected PV: %v, got: %v", k, tc.expectedPVSpec.CSIPVS, pv.Spec.PersistentVolumeSource.CSI)
+				}
+			}
+		}
 	}
 }
